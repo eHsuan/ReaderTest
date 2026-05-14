@@ -17,6 +17,7 @@ namespace ReaderTestApp
         private CancellationTokenSource? _cts;
         private readonly List<ReaderInstance> _activeReaders = new();
         private static readonly object _csvLock = new object();
+        private string _calibCommand = "TUNE,01\r";
 
         public Form1()
         {
@@ -33,12 +34,22 @@ namespace ReaderTestApp
                     .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
                     .Build();
 
+                _calibCommand = config["CalibrationCommand"] ?? "TUNE,01\r";
                 int activeCount = int.Parse(config["ActiveReaderCount"] ?? "0");
-                activeCount = Math.Clamp(activeCount, 0, 2);
+                activeCount = Math.Clamp(activeCount, 0, 4);
 
                 _activeReaders.Clear();
                 var readersConfig = config.GetSection("Readers").GetChildren();
                 int index = 0;
+
+                TextBox[] logBoxes = { txtLog1, txtLog2, txtLog3, txtLog4 };
+                Label[] nameLabels = { lblName1, lblName2, lblName3, lblName4 };
+                Button[] calibBtns = { btnCalib1, btnCalib2, btnCalib3, btnCalib4 };
+
+                // 隱藏所有
+                foreach (var tb in logBoxes) tb.Visible = false;
+                foreach (var lb in nameLabels) lb.Visible = false;
+                foreach (var bt in calibBtns) bt.Visible = false;
 
                 foreach (var rCfg in readersConfig)
                 {
@@ -52,19 +63,19 @@ namespace ReaderTestApp
                         PollingInterval = int.Parse(rCfg["PollingIntervalMs"] ?? "500"),
                         TriggerCommand = rCfg["TriggerCommand"] ?? "LON\r",
                         TimeoutMs = int.Parse(rCfg["TimeoutMs"] ?? "2000"),
-                        LogControl = index == 0 ? txtLogLeft : txtLogRight,
-                        NameLabel = index == 0 ? lblNameLeft : lblNameRight
+                        LogControl = logBoxes[index],
+                        NameLabel = nameLabels[index],
+                        CalibButton = calibBtns[index]
                     };
+
+                    instance.LogControl.Visible = true;
+                    instance.NameLabel.Visible = true;
+                    instance.CalibButton.Visible = true;
+                    instance.NameLabel.Text = instance.Name;
+
                     _activeReaders.Add(instance);
                     index++;
                 }
-
-                // UI 更新
-                lblNameLeft.Visible = txtLogLeft.Visible = activeCount >= 1;
-                lblNameRight.Visible = txtLogRight.Visible = activeCount >= 2;
-                
-                if (activeCount >= 1) lblNameLeft.Text = _activeReaders[0].Name;
-                if (activeCount >= 2) lblNameRight.Text = _activeReaders[1].Name;
 
                 AppendSystemLog($"[系統] 載入設定成功，啟動讀取器數量: {activeCount}");
             }
@@ -112,6 +123,74 @@ namespace ReaderTestApp
             await Task.Delay(100);
         }
 
+        private async void btnCalibrate_Click(object sender, EventArgs e)
+        {
+            if (_isRunning)
+            {
+                MessageBox.Show("請先停止測試再進行校正。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            Button btn = (Button)sender;
+            int readerIdx = (int)btn.Tag;
+            if (readerIdx >= _activeReaders.Count) return;
+
+            var reader = _activeReaders[readerIdx];
+            btn.Enabled = false;
+            AppendLog(reader, $"[系統] 開始校正指令: {_calibCommand.Trim()}");
+
+            try
+            {
+                string result = await SendCalibCommandAsync(reader);
+                AppendLog(reader, $"[校正結果] {result}");
+            }
+            catch (Exception ex)
+            {
+                AppendLog(reader, $"[校正失敗] {ex.Message}");
+            }
+            finally
+            {
+                btn.Enabled = true;
+            }
+        }
+
+        private async Task<string> SendCalibCommandAsync(ReaderInstance reader)
+        {
+            using var client = new TcpClient();
+            try
+            {
+                // 使用 WaitAsync 處理連線超時
+                await client.ConnectAsync(reader.IP, reader.Port).WaitAsync(TimeSpan.FromMilliseconds(reader.TimeoutMs));
+            }
+            catch (TimeoutException)
+            {
+                throw new TimeoutException("連線逾時");
+            }
+
+            using var stream = client.GetStream();
+            byte[] data = Encoding.ASCII.GetBytes(_calibCommand);
+            await stream.WriteAsync(data);
+
+            byte[] buffer = new byte[1024];
+            // 校正可能需要較長時間，給予 5 秒等待
+            DateTime start = DateTime.Now;
+            StringBuilder sb = new StringBuilder();
+
+            while ((DateTime.Now - start).TotalSeconds < 5)
+            {
+                if (client.Available > 0)
+                {
+                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length);
+                    string part = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                    sb.Append(part);
+                    if (part.Contains("\r")) break;
+                }
+                await Task.Delay(100);
+            }
+
+            return sb.ToString().Trim('\r', '\n', ' ');
+        }
+
         private async Task PollingLoop(ReaderInstance reader, CancellationToken token)
         {
             while (!token.IsCancellationRequested)
@@ -146,33 +225,48 @@ namespace ReaderTestApp
             await stream.WriteAsync(data, token);
 
             byte[] buffer = new byte[1024];
-            int bytesRead = await stream.ReadAsync(buffer, token);
-            if (bytesRead == 0) return "";
+            StringBuilder sb = new StringBuilder();
+            DateTime startTime = DateTime.Now;
 
-            return Encoding.ASCII.GetString(buffer, 0, bytesRead).Trim('\r', '\n', ' ');
+            while ((DateTime.Now - startTime).TotalMilliseconds < reader.TimeoutMs && !token.IsCancellationRequested)
+            {
+                if (client.Available > 0)
+                {
+                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token);
+                    if (bytesRead > 0)
+                    {
+                        string part = Encoding.ASCII.GetString(buffer, 0, bytesRead);
+                        sb.Append(part);
+                        if (part.Contains("\r"))
+                        {
+                            string fullReceived = sb.ToString();
+                            string[] lines = fullReceived.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                            foreach (var line in lines)
+                            {
+                                string cleanLine = line.Trim();
+                                if (string.IsNullOrEmpty(cleanLine) || cleanLine == "OK" || cleanLine == "LON" || cleanLine == "ERROR") continue;
+                                return cleanLine;
+                            }
+                            sb.Clear();
+                        }
+                    }
+                }
+                await Task.Delay(30, token);
+            }
+            return "";
         }
 
         private void ProcessResult(ReaderInstance reader, string currentId)
         {
-            bool isCurrentValid = !string.IsNullOrEmpty(currentId) && currentId != "ERROR";
-
-            if (isCurrentValid)
+            if (!string.IsNullOrEmpty(currentId))
             {
-                if (!reader.IsLastReadValid || currentId != reader.LastSavedPanelId)
+                if (currentId != reader.LastSavedPanelId)
                 {
                     SaveToCsv(reader.Name, currentId);
                     reader.LastSavedPanelId = currentId;
                     AppendLog(reader, $"[讀取成功] ID: {currentId}");
                 }
                 reader.IsLastReadValid = true;
-            }
-            else
-            {
-                if (reader.IsLastReadValid)
-                {
-                    AppendLog(reader, "[狀態重置] 視野內無條碼");
-                }
-                reader.IsLastReadValid = false;
             }
         }
 
@@ -192,15 +286,12 @@ namespace ReaderTestApp
                     {
                         if (!fileExists)
                         {
-                            writer.WriteLine("Timestamp,ReaderName,Panel_ID");
+                            writer.WriteLine("Timestamp,ReaderName,ID");
                         }
                         writer.WriteLine($"{DateTime.Now:yyyy/MM/dd HH:mm:ss.fff},{readerName},{panelId}");
                     }
                 }
-                catch (Exception ex)
-                {
-                    // 若寫入失敗，僅能顯示在系統日誌中，避免主迴圈崩潰
-                }
+                catch { }
             }
         }
 
@@ -234,7 +325,6 @@ namespace ReaderTestApp
 
         private void AppendSystemLog(string message)
         {
-            // 將系統日誌顯示在第一個啟用的 Reader TextBox，若無啟動則不顯示
             if (_activeReaders.Count > 0)
             {
                 AppendLog(_activeReaders[0], message);
@@ -253,6 +343,7 @@ namespace ReaderTestApp
             public bool IsLastReadValid { get; set; } = false;
             public TextBox LogControl { get; set; } = null!;
             public Label NameLabel { get; set; } = null!;
+            public Button CalibButton { get; set; } = null!;
 
             public void ResetState()
             {
@@ -262,3 +353,4 @@ namespace ReaderTestApp
         }
     }
 }
+

@@ -72,6 +72,7 @@ namespace ReaderTestApp
                     instance.NameLabel.Visible = true;
                     instance.CalibButton.Visible = true;
                     instance.NameLabel.Text = instance.Name;
+                    instance.CalibButton.Text = instance.Name;
 
                     _activeReaders.Add(instance);
                     index++;
